@@ -25,6 +25,8 @@
 
 import argparse
 import fnmatch
+import hashlib
+import io
 import logging
 import os
 import sys
@@ -425,6 +427,8 @@ def parse_command_line(argv):
                         action=DictArgs)
     parser.add_argument("-x", "--exclude", type=str, nargs="*",
                         help="File path patterns to exclude")
+    parser.add_argument("--force", action="store_true", dest="force",
+                        help="Force writing files even if their contents have not changed after header injection.")
     parser.add_argument("--force-overwrite", action="store_true", dest="force_overwrite",
                         help="Try to include headers even in read-only files, given sufficient permissions. "
                              "File permissions are restored after successful header injection.")
@@ -575,6 +579,7 @@ def read_file(file, args, type_settings):
     head_end = None
     years_line = None
     have_license = False
+    contents_digest = None
     filename, extension = os.path.splitext(file)
     LOGGER.debug("File name is %s", os.path.basename(filename))
     LOGGER.debug("File extension is %s", extension)
@@ -590,6 +595,15 @@ def read_file(file, args, type_settings):
         LOGGER.error("File %s is not readable.", file)
     with open(file, 'r', encoding=args.encoding, errors="replace") as f:
         lines = f.readlines()
+
+    if not args.force:
+        # If writing files regardless of whether their contents change is
+        # not forced, compute the digest for the file's original contents
+        digester = hashlib.sha1()
+        for line in lines:
+            digester.update(line.encode(args.encoding))
+        contents_digest = digester.hexdigest()
+
     # now iterate throw the lines and try to determine the various indies
     # first try to find the start of the header: skip over shebang or empty lines
     keep_first = settings.get("keepFirst")
@@ -626,7 +640,8 @@ def read_file(file, args, type_settings):
                     "headEnd": None,
                     "yearsLine": None,
                     "settings": settings,
-                    "haveLicense": have_license
+                    "haveLicense": have_license,
+                    "contentsDigest": contents_digest
                     }
         i = i + 1
     LOGGER.debug("Found preliminary start at {}, i={}, lines={}".format(head_start, i, len(lines)))
@@ -641,7 +656,8 @@ def read_file(file, args, type_settings):
                 "headEnd": head_end,
                 "yearsLine": years_line,
                 "settings": settings,
-                "haveLicense": have_license
+                "haveLicense": have_license,
+                "contentsDigest": contents_digest
                 }
     # otherwise process the comment block until it ends
     if isBlockHeader:
@@ -658,7 +674,8 @@ def read_file(file, args, type_settings):
                         "headEnd": j,
                         "yearsLine": years_line,
                         "settings": settings,
-                        "haveLicense": have_license
+                        "haveLicense": have_license,
+                        "contentsDigest": contents_digest
                         }
             elif yearsPattern.findall(lines[j]):
                 have_license = True
@@ -673,7 +690,8 @@ def read_file(file, args, type_settings):
                 "headEnd": None,
                 "yearsLine": None,
                 "settings": settings,
-                "haveLicense": have_license
+                "haveLicense": have_license,
+                "contentsDigest": contents_digest
                 }
     else:
         LOGGER.debug("ELSE1")
@@ -689,7 +707,8 @@ def read_file(file, args, type_settings):
                         "headEnd": j - 1,
                         "yearsLine": years_line,
                         "settings": settings,
-                        "haveLicense": have_license
+                        "haveLicense": have_license,
+                        "contentsDigest": contents_digest
                         }
             elif yearsPattern.findall(lines[j]):
                 have_license = True
@@ -704,7 +723,8 @@ def read_file(file, args, type_settings):
                 "headEnd": len(lines) - 1,
                 "yearsLine": years_line,
                 "settings": settings,
-                "haveLicense": have_license
+                "haveLicense": have_license,
+                "contentsDigest": contents_digest
                 }
 
 
@@ -732,16 +752,17 @@ class OpenAsWriteable(object):
     argument not being set), this contextmanager yields None on __enter__.
     """
 
-    def __init__(self, filename, arguments):
+    def __init__(self, filename, original_digest, arguments):
         """
         Initialize an OpenAsWriteable context manager
         :param filename: path to the file to open
+        :param original_digest: digest of the file's original contents
         :param arguments: program arguments
         """
         self._filename  = filename
+        self._original_digest = original_digest
         self._arguments = arguments
         self._file_handle = None
-        self._file_permissions = None
 
     def __enter__(self):
         """
@@ -750,55 +771,70 @@ class OpenAsWriteable(object):
         filename = self._filename
         arguments = self._arguments
         file_handle = None
-        file_permissions = None
 
         if os.path.isfile(filename):
-            file_permissions = stat.S_IMODE(os.lstat(filename).st_mode)
-
-            if not os.access(filename, os.W_OK):
-                if arguments.force_overwrite:
-                    try:
-                        os.chmod(filename, file_permissions | stat.S_IWUSR)
-                    except PermissionError:
-                        LOGGER.warning("File {} cannot be made writable, it will be skipped.".format(filename))
-                else:
-                    LOGGER.warning("File {} is not writable, it will be skipped.".format(filename))
-
-            if os.access(filename, os.W_OK):
-                file_handle = open(filename, 'w', encoding=arguments.encoding)
+            file_handle = io.StringIO()
         else:
             LOGGER.warning("File {} does not exist, it will be skipped.".format(filename))
 
         self._file_handle = file_handle
-        self._file_permissions = file_permissions
 
         return file_handle
 
     def __exit__ (self, exc_type, exc_value, traceback):
-        """
-        Restore back file permissions and close file handle (if any).
-        """
         if (self._file_handle is not None):
-            self._file_handle.close()
+            if (self._original_digest is not None):
+                # If the digest for the file's original contents was provided,
+                # compute the digest for the pending new contents
+                digester = hashlib.sha1()
+                digester.update(self._file_handle.getvalue().encode(self._arguments.encoding))
+                new_digest = digester.hexdigest()
 
-            actual_permissions = stat.S_IMODE(os.lstat(self._filename).st_mode)
-            if (actual_permissions != self._file_permissions):
+                # If the two digests match, skip writing the file
+                if new_digest == self._original_digest:
+                    LOGGER.debug("File {} contents would be unchanged, it will not be written.".format(self._filename))
+                    self._file_handle = None
+                    return True
+
+            is_writable = os.access(self._filename, os.W_OK)
+            original_permissions = None
+
+            # Save original permissions and make writable if necessary
+            if not is_writable:
+                if self._arguments.force_overwrite:
+                    original_permissions = stat.S_IMODE(os.stat(self._filename).st_mode)
+                    try:
+                        os.chmod(self._filename, original_permissions | stat.S_IWUSR)
+                    except PermissionError:
+                        original_permissions = None
+                        LOGGER.warning("File {} cannot be made writable, it will be skipped.".format(self._filename))
+                else:
+                    LOGGER.warning("File {} is not writable, it will be skipped.".format(self._filename))
+
+            if os.access(self._filename, os.W_OK):
+                make_backup(self._filename, self._arguments)
+                with open(self._filename, 'w', encoding=self._arguments.encoding) as file_handle:
+                    file_handle.write(self._file_handle.getvalue())
+
+            # Restore back original permissions if necessary
+            if (original_permissions is not None):
                 try:
-                    os.chmod(self._filename, self._file_permissions)
+                    os.chmod(self._filename, original_permissions)
                 except PermissionError:
                     LOGGER.error("File {} permissions could not be restored.".format(self._filename))
 
+            # TODO: optionally remove backup if all worked well?
             self._file_handle = None
-            self._file_permissions = None
+
         return True
 
 
 @contextlib.contextmanager
-def open_as_writable(file, arguments):
+def open_as_writable(file, original_digest, arguments):
     """
     Wrapper around OpenAsWriteable context manager.
     """
-    with OpenAsWriteable(file, arguments=arguments) as fw:
+    with OpenAsWriteable(file, original_digest=original_digest, arguments=arguments) as fw:
         yield fw
 
 
@@ -945,11 +981,10 @@ def main():
                     finfo["yearsLine"])
                 # if we have a template: replace or add
                 if template_lines:
-                    make_backup(file, arguments)
                     if arguments.dry:
                         LOGGER.info("Would be updating changed file: {}".format(file))
                     else:
-                        with open_as_writable(file, arguments) as fw:
+                        with open_as_writable(file, finfo["contentsDigest"], arguments) as fw:
                             if (fw is not None):
                                 # if we found a header, replace it
                                 # otherwise, add it after the lines to skip
@@ -974,16 +1009,14 @@ def main():
                                         # There is some header, but not license - add an empty line
                                         fw.write("\n")
                                     fw.writelines(lines[skip:])
-                        # TODO: optionally remove backup if all worked well?
                 else:
                     # no template lines, just update the line with the year, if we found a year
                     years_line = finfo["yearsLine"]
                     if years_line is not None:
-                        make_backup(file, arguments)
                         if arguments.dry:
                             LOGGER.info("Would be updating year line in file {}".format(file))
                         else:
-                            with open_as_writable(file, arguments) as fw:
+                            with open_as_writable(file, finfo["contentsDigest"], arguments) as fw:
                                 if (fw is not None):
                                     LOGGER.debug("Updating years in file {} in line {}".format(file, years_line))
                                     fw.writelines(lines[0:years_line])
